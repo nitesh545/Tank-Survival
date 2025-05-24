@@ -15,6 +15,9 @@ struct Object;
 #[derive(Component)]
 struct Pickup;
 
+#[derive(Component)]
+struct Bullet;
+
 #[derive(Resource)]
 struct ObjectSpawnTimer(Timer);
 
@@ -39,7 +42,7 @@ fn spawn_player(mut commands: Commands, asset_server: Res<AssetServer>) {
         .spawn((
             Sprite::from(asset_server.load("tank.png")),
             Transform::from_scale(Vec3::splat(0.75)),
-            RigidBody::Dynamic,
+            RigidBody::Kinematic,
             Collider::circle(50.0),
             CollidingEntities::default(),
             ExternalForce::new(Vec2::Y),
@@ -126,23 +129,109 @@ fn spawn_objects(
     asset_server: Res<AssetServer>,
     time: Res<Time>,
     mut timer: ResMut<ObjectSpawnTimer>,
+    q_window: Query<&Window, With<PrimaryWindow>>,
 ) {
     let mut rng = rand::rng();
-    let rand_loc_x = rng.random_range(-600.0..600.0);
-    let rand_loc_y = rng.random_range(-600.0..600.0);
+    let rand_loc_x = rng.random_range(10.0..250.0);
+    let rand_loc_y = rng.random_range(10.0..250.0);
+    let rand_select_x = rng.random_range(0..=1) as usize;
+    let rand_select_y = rng.random_range(0..=1) as usize;
+    let win = q_window.single().unwrap();
+    let y_positive = win.height() + rand_loc_y;
+    let x_positive = win.width()+ rand_loc_x;
+    let y_negative = (win.height() * -1.) - rand_loc_y;
+    let x_negative = (win.width() * -1.) - rand_loc_x;
+    let xs = [x_negative, x_positive];
+    let ys = [y_negative, y_positive];
 
     if timer.0.tick(time.delta()).just_finished() {
         commands.spawn((
             Sprite::from(asset_server.load("drone.png")),
-            Transform::from_xyz(rand_loc_x, rand_loc_y, 0.0).with_scale(Vec3::splat(1.)),
+            Transform::from_xyz(xs[rand_select_x], ys[rand_select_y], 0.0).with_scale(Vec3::splat(1.)),
             RigidBody::Kinematic,
-            Collider::circle(150.0),
+            Collider::circle(10.0),
             Sensor,
             CollidingEntities::default(),
             Object,
         ));
     }
 }
+
+fn move_objects (
+    q_object: Query<&mut Transform, (With<Object>, Without<Player>)>,
+    q_player: Query<&Transform, With<Player>>,
+) {
+    let transform_player = match q_player.single() {
+        Ok(k) => k,
+        Err(_e) => return,
+    };
+    for mut transform_object in q_object {
+        let direction = (transform_object.translation - transform_player.translation).normalize() * -1.;
+        transform_object.translation.x += direction.x;
+        transform_object.translation.y += direction.y;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+    pub fn fire_bullet(
+        mut commands: Commands,
+        keyboard_input: Res<ButtonInput<KeyCode>>,
+        mouse_input: Res<ButtonInput<MouseButton>>,
+        asset_server: Res<AssetServer>,
+        mut q_player: Query<&mut Transform, With<Player>>,
+        q_windows: Query<&Window, With<PrimaryWindow>>,
+        q_camera: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
+    ) {
+        let (camera, camera_transform) = match q_camera.single() {
+            Ok(k) => k,
+            Err(_e) => return,
+        };
+        if keyboard_input.just_pressed(KeyCode::Space)
+            || mouse_input.just_pressed(MouseButton::Left)
+        {
+            let win = q_windows.single().unwrap();
+            let position = win.cursor_position().unwrap();
+            let Ok(world_pos_cursor) = camera.viewport_to_world_2d(camera_transform, position) else {return;};
+            for transform in q_player.iter_mut() {
+                let pos = Vec2::from((
+                    world_pos_cursor.x,
+                    world_pos_cursor.y,
+                ));
+                let dir = (pos - transform.translation.truncate()).normalize();
+                let angle = dir.y.atan2(dir.x);
+                commands
+                    .spawn((
+                        Sprite::from_image(asset_server.load("bullet.png")),
+                        Transform::from_translation(transform.translation)
+                            .with_scale(Vec3::splat(1.))
+                            .with_rotation(Quat::from_rotation_z(angle - std::f32::consts::FRAC_PI_2)),
+                        Bullet,
+                        RigidBody::Kinematic,
+                        Collider::circle(10.),
+                        CollidingEntities::default(),
+                        //Sensor,
+                    ));
+                    
+                // let bullet_fire_entity = commands
+                //     .spawn((
+                //         AudioPlayer::new(asset_server.load("fire.ogg")),
+                //         PlaybackSettings::ONCE,
+                //     ))
+                //     .id();
+            }
+        }
+    }
+    
+fn move_bullet(
+        mut query: Query<&mut Transform, With<Bullet>>,
+        time: Res<Time>,
+    ) {
+        let time_step = time.delta_secs();
+        for mut transform in query.iter_mut() {
+            let up_direction = transform.up();
+            transform.translation += 1000. * time_step * up_direction;
+        }
+    }
 
 #[allow(dead_code)]
 fn spawn_pickups(
@@ -169,43 +258,25 @@ fn spawn_pickups(
 }
 
 fn detect_collisions(
-    mut q_colliding_entities: Query<(Entity, &CollidingEntities, &mut ExternalForce)>,
+    mut q_colliding_entities: Query<(Entity, &CollidingEntities)>,
     q_player: Query<Entity, With<Player>>,
     q_object: Query<Entity, With<Object>>,
-    q_transform: Query<&Transform>,
+    q_bullet: Query<Entity, With<Bullet>>,
+    mut commands: Commands,
 ) {
     let players: Vec<Entity> = q_player.iter().collect();
     let objects: Vec<Entity> = q_object.iter().collect();
-    for (entity, colliding_entities, mut force) in q_colliding_entities.iter_mut() {
+    let bullets: Vec<Entity> = q_bullet.iter().collect();
+    for (entity, colliding_entities) in q_colliding_entities.iter_mut() {
         let coll_entis = colliding_entities.iter().collect::<Vec<_>>();
         for ent in coll_entis {
             if objects.contains(ent) && players.contains(&entity) {
-                let player_transform = q_transform.get(entity).unwrap();
-                let object_transform = q_transform.get(*ent).unwrap();
-                let player_pos = player_transform.translation;
-                let object_pos = object_transform.translation;
-                let dir = (object_pos - player_pos).normalize();
-                let x = dir.x * 25.;
-                let y = dir.y * 25.;
-                force.apply_force(Vec2 { x, y });
+                println!("Game Over");
             }
-        }
-    }
-}
-
-fn consume_planets(
-    q_objects: Query<(Entity, &Transform), With<Object>>,
-    mut q_player: Query<&mut Transform, (With<Player>, Without<Object>)>,
-    mut commands: Commands,
-) {
-    let mut player_transform = q_player.single_mut().unwrap();
-    for (object, object_transform) in q_objects {
-        if (player_transform.translation.x - object_transform.translation.x).abs() <= 25.0
-            && (player_transform.translation.y - object_transform.translation.y).abs() <= 25.0
-        {
-            commands.entity(object.entity()).despawn();
-            player_transform.translation.x = 0.;
-            player_transform.translation.y = 0.;
+            if bullets.contains(ent) && objects.contains(&entity) || bullets.contains(&entity) && objects.contains(ent){
+                commands.entity(*ent).despawn();
+                commands.entity(entity).despawn();
+            }
         }
     }
 }
@@ -293,9 +364,11 @@ fn main() {
         .add_systems(Update, rotate_player)
         .add_systems(Update, rotate_turret)
         .add_systems(Update, spawn_objects)
+        .add_systems(Update, move_objects)
         .add_systems(Update, detect_collisions)
+        .add_systems(Update, fire_bullet)
+        .add_systems(Update, move_bullet)
         .add_systems(Update, quit_game)
-        .add_systems(Update, consume_planets)
         .add_systems(Update, check_boundaries)
         .run();
 }
